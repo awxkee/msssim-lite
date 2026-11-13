@@ -32,6 +32,8 @@
 #[cfg(not(all(feature = "neon", target_arch = "aarch64")))]
 use crate::image::normalize;
 use crate::pyramid::WINDOW;
+#[cfg(not(all(feature = "neon", target_arch = "aarch64")))]
+use crate::pyramid::normalize_sum;
 
 pub(crate) type DeficitFn<A = f32, B = A> =
     unsafe fn(&[A], usize, &[B], usize, usize, usize) -> f64;
@@ -76,6 +78,26 @@ pub(crate) fn mixed_scalar(
         width,
         height,
         normalize,
+    )
+}
+
+#[cfg(not(all(feature = "neon", target_arch = "aarch64")))]
+pub(crate) fn byte_sum_scalar(
+    reference: &[u16],
+    reference_stride: usize,
+    test: &[f32],
+    test_stride: usize,
+    width: usize,
+    height: usize,
+) -> f64 {
+    float_scalar(
+        reference,
+        reference_stride,
+        test,
+        test_stride,
+        width,
+        height,
+        normalize_sum,
     )
 }
 

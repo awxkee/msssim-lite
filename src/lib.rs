@@ -55,7 +55,7 @@
 //! ```
 //!
 //! Reuse a [`PreparedReference`] when one reference is compared with many
-//! candidates: its padded pyramid is built once.
+//! candidates: its pyramid is built once, with replicated edges filled as needed.
 //!
 //! ```
 //! use msssim_lite::{GrayImage, PreparedReference};
@@ -70,14 +70,21 @@
 //!
 //! Use [`PreparedReference::incremental`] to score local candidate edits and
 //! [`Checkpoint`] to roll back trial updates.
+//! When you can transfer ownership of a packed candidate, use
+//! [`IncrementalState::from_u8`] or [`IncrementalState::from_unit_f32`] to
+//! reuse its allocation.
+//! Use [`ComparisonWorkspace`] to reuse scratch across prepared comparisons
+//! or patch trials.
 //!
 //! Comparisons stream tiles with bounded scratch space. The `neon` feature
-//! selects NEON unconditionally on AArch64. On x86, AVX2+FMA and SSE2 are
-//! selected at runtime when enabled. A portable fallback is also available.
+//! selects NEON on AArch64 and uses dot-product instructions for byte
+//! scoring when the CPU supports them. AVX2+FMA is selected at runtime on
+//! x86-64, and SSE2 is available on both 32-bit and 64-bit x86 when enabled.
+//! A portable fallback is also available.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-#[cfg(all(feature = "avx", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(feature = "avx", target_arch = "x86_64"))]
 mod avx;
 mod dispatch;
 mod image;
@@ -89,15 +96,15 @@ mod neon;
 mod pyramid;
 #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
 mod sse;
-#[cfg(all(
-    any(feature = "avx", feature = "sse"),
-    any(target_arch = "x86", target_arch = "x86_64")
+#[cfg(any(
+    all(feature = "avx", target_arch = "x86_64"),
+    all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64"))
 ))]
 mod x86;
 
 pub use image::GrayImage;
 pub use incremental::{Checkpoint, IncrementalState, Rect};
-pub use metric::{DEFAULT_SCALES, MAX_SCALES, PreparedReference, Score};
+pub use metric::{ComparisonWorkspace, DEFAULT_SCALES, MAX_SCALES, PreparedReference, Score};
 
 /// Multi-scale SSIM deficit of `test` against `reference` at
 /// [`DEFAULT_SCALES`] scales (0 is identical).
@@ -114,7 +121,8 @@ pub enum Error {
     InvalidLayout,
     /// Reference and test dimensions differ.
     DimensionMismatch,
-    /// The number of scales must be in `1..=MAX_SCALES`.
+    /// The scale count must be in `1..=MAX_SCALES` and any cached scale count
+    /// must be in `1..=scales`.
     InvalidScales,
     /// A floating-point sample is NaN or infinite.
     NonFiniteSample,

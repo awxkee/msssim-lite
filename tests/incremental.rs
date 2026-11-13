@@ -98,6 +98,31 @@ fn byte_updates_match_full_comparisons_and_reuse_checkpoints() {
 }
 
 #[test]
+fn update_and_rollback_across_tile_tree_depths() {
+    let (w, h) = (41, 21);
+    let reference = texture(w, h);
+    let prepared = PreparedReference::with_scales(bytes(&reference, w, h), 1).unwrap();
+    let initial: Vec<_> = reference.iter().map(|&v| v & !3).collect();
+    let mut state = prepared.incremental(bytes(&initial, w, h)).unwrap();
+    let baseline = state.score();
+
+    // These tiles include the last shallow leaf and the first deeper leaves.
+    let rect = Rect::new(10, 16, w, h);
+    let mut trial = initial;
+    for row in trial.chunks_exact_mut(w).skip(rect.y0) {
+        row[rect.x0..].fill(127);
+    }
+    let mut checkpoint = Checkpoint::default();
+    let trial = bytes(&trial, w, h);
+    state
+        .update_checkpointed(trial, rect, &mut checkpoint)
+        .unwrap();
+    check_score(state.score(), prepared.compare(trial).unwrap());
+    state.rollback(&checkpoint);
+    assert_eq!(state.score(), baseline);
+}
+
+#[test]
 fn float_update_reads_only_its_rectangle_and_errors_are_transactional() {
     let (w, h) = (73, 51);
     let stride = w + 9;
@@ -324,4 +349,97 @@ fn checkpoints_only_restore_the_matching_state_and_revision() {
         .update(bytes(&source, w, h), Rect::new(0, 0, w, h))
         .unwrap();
     assert_eq!(state.score().deficit(), 0.0);
+}
+
+#[test]
+fn unchanged_updates_advance_and_restore_checkpoint_revisions() {
+    let (w, h) = (37, 35);
+    let source = texture(w, h);
+    let initial = bytes(&source, w, h);
+    let prepared = PreparedReference::new(initial).unwrap();
+    let mut state = prepared.incremental(initial).unwrap();
+    let mut outer = Checkpoint::default();
+    let mut unchanged = Checkpoint::default();
+    let (x, y) = (w - 2, h - 2);
+    let patch_samples = [91, 123, 0, 215, 46];
+    let patch = GrayImage::u8(&patch_samples, 2, 2, 3).unwrap();
+
+    state
+        .update_patch_checkpointed(patch, x, y, &mut outer)
+        .unwrap();
+    let changed = state.score();
+    state
+        .update_patch_checkpointed(patch, x, y, &mut unchanged)
+        .unwrap();
+    assert_eq!(unchanged.allocated_bytes(), 0);
+    state.rollback(&outer);
+    assert_eq!(state.score(), changed);
+    state.rollback(&unchanged);
+    state.rollback(&outer);
+    assert_eq!(state.score().deficit(), 0.0);
+
+    state
+        .update_patch_checkpointed(patch, x, y, &mut outer)
+        .unwrap();
+    state
+        .update_patch_checkpointed(patch, x, y, &mut outer)
+        .unwrap();
+    state.rollback(&outer);
+    assert_eq!(state.score(), changed);
+
+    // An unchanged committed update also advances the revision.
+    state
+        .update_checkpointed(initial, Rect::new(x, y, w, h), &mut outer)
+        .unwrap();
+    state.update(initial, Rect::new(x, y, w, h)).unwrap();
+    state.rollback(&outer);
+    assert_eq!(state.score().deficit(), 0.0);
+}
+
+#[test]
+fn sparse_strided_update_checkpoints_only_the_changed_bounds() {
+    let (w, h) = (269, 137);
+    let source = texture(w, h);
+    let initial = bytes(&source, w, h);
+    let prepared = PreparedReference::new(initial).unwrap();
+    let mut state = prepared.incremental(initial).unwrap();
+    let before = state.score();
+    let (x, y) = (249, 118);
+    let (pw, ph, stride) = (w - x, h - y, 29);
+    let mut patch = vec![255; (ph - 1) * stride + pw];
+    for (row, dst) in patch.chunks_mut(stride).enumerate() {
+        dst[..pw].copy_from_slice(&source[(y + row) * w + x..][..pw]);
+    }
+    let mut expected = source.clone();
+    let edits = [(pw - 3, ph - 4), (pw - 2, ph - 3), (pw - 4, ph - 1)];
+    for (px, py) in edits {
+        patch[py * stride + px] ^= 123;
+        expected[(y + py) * w + x + px] = patch[py * stride + px];
+    }
+    let mut expected_state = prepared.incremental(initial).unwrap();
+    let mut expected_checkpoint = Checkpoint::default();
+    expected_state
+        .update_checkpointed(
+            bytes(&expected, w, h),
+            Rect::new(w - 4, h - 4, w - 1, h),
+            &mut expected_checkpoint,
+        )
+        .unwrap();
+    let mut checkpoint = Checkpoint::default();
+    state
+        .update_patch_checkpointed(
+            GrayImage::u8(&patch, pw, ph, stride).unwrap(),
+            x,
+            y,
+            &mut checkpoint,
+        )
+        .unwrap();
+    assert_eq!(state.score(), expected_state.score());
+    // The 3×4 bounds fit in a single tile. The original patch spans four.
+    assert_eq!(
+        checkpoint.allocated_bytes(),
+        expected_checkpoint.allocated_bytes()
+    );
+    state.rollback(&checkpoint);
+    assert_eq!(state.score(), before);
 }

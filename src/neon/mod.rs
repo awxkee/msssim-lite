@@ -28,7 +28,11 @@
  */
 
 mod bytes;
+mod downsample;
 mod metric;
 
 pub(crate) use bytes::byte_deficit;
-pub(crate) use metric::{deficit, mixed_deficit};
+#[cfg(target_endian = "little")]
+pub(crate) use bytes::byte_deficit_dot;
+pub(crate) use downsample::{halve_bytes, halve_float_in_place};
+pub(crate) use metric::{byte_sum_deficit, deficit, mixed_deficit};

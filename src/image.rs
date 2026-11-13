@@ -28,7 +28,7 @@
  */
 
 use crate::Error;
-use crate::pyramid::{Layout, Level, PackedLevel, Plane, Region, TilePlane};
+use crate::pyramid::{Layout, Level, PackedLevel, Plane, Region, TilePlane, scratch_slice};
 
 #[derive(Clone, Copy)]
 enum Samples<'a> {
@@ -90,16 +90,12 @@ impl<'a> GrayImage<'a> {
         matches!(self.samples, Samples::U8(_))
     }
 
-    pub(crate) fn from_packed(level: &'a Level, height: usize) -> Self {
-        let (samples, width) = match level {
-            Level::Byte(level) => (Samples::U8(&level.samples), level.width),
-            Level::Float(level) => (Samples::UnitF32(&level.samples), level.width),
-        };
-        Self {
-            samples,
-            width,
-            height,
-            stride: width,
+    pub(crate) fn same_byte_view(self, other: GrayImage<'_>) -> bool {
+        match (self.samples, other.samples) {
+            (Samples::U8(a), Samples::U8(b)) => {
+                a.as_ptr() == b.as_ptr() && (self.height == 1 || self.stride == other.stride)
+            }
+            _ => false,
         }
     }
 
@@ -122,7 +118,7 @@ impl<'a> GrayImage<'a> {
     pub(crate) fn borrow_region<'tile>(
         self,
         region: Region,
-        scratch: &'tile mut [u8],
+        scratch: &'tile mut Vec<u8>,
     ) -> Result<Option<TilePlane<'tile>>, Error>
     where
         'a: 'tile,
@@ -132,7 +128,7 @@ impl<'a> GrayImage<'a> {
                 let plane = if let Some(plane) = self.interior(samples, region) {
                     plane
                 } else {
-                    let scratch = &mut scratch[..region.width * region.height];
+                    let scratch = scratch_slice(scratch, region.width * region.height);
                     self.write_rows(samples, region, scratch, |_| Ok(()))?;
                     Plane::packed(scratch, region)
                 };
@@ -173,16 +169,28 @@ impl<'a> GrayImage<'a> {
         self.write_rows(samples, region, output, check_finite)
     }
 
-    pub(crate) fn padded(self, region: Region) -> Result<Level, Error> {
-        let width = region.width;
+    pub(crate) fn to_packed(self) -> Result<Level, Error> {
+        self.to_packed_with_bound(false).map(|(level, _)| level)
+    }
+
+    pub(crate) fn to_packed_with_bound(self, check_bound: bool) -> Result<(Level, bool), Error> {
+        let width = self.width;
         match self.samples {
             Samples::U8(samples) => {
-                let samples = self.collect_rows(samples, region, |_| Ok(()))?;
-                Ok(Level::Byte(PackedLevel { samples, width }))
+                let samples = self.collect_rows(samples, |_| Ok(()))?;
+                Ok((Level::Byte(PackedLevel { samples, width }), false))
             }
             Samples::UnitF32(samples) => {
-                let samples = self.collect_rows(samples, region, check_finite)?;
-                Ok(Level::Float(PackedLevel { samples, width }))
+                let mut bounded = check_bound;
+                let samples = self.collect_rows(samples, |row| {
+                    if bounded {
+                        bounded = check_patch_bound(row)?;
+                        Ok(())
+                    } else {
+                        check_finite(row)
+                    }
+                })?;
+                Ok((Level::Float(PackedLevel { samples, width }), bounded))
             }
         }
     }
@@ -224,23 +232,37 @@ impl<'a> GrayImage<'a> {
     fn collect_rows<T: Copy>(
         self,
         samples: &[T],
-        region: Region,
-        validate: impl Fn(&[T]) -> Result<(), Error>,
+        mut validate: impl FnMut(&[T]) -> Result<(), Error>,
     ) -> Result<Vec<T>, Error> {
-        let mut output = Vec::with_capacity(region.width * region.height);
-        let rows = self.visible_rows(samples, region);
-        let visible_height = rows.len();
-        for (y, row) in rows.enumerate() {
+        let mut output = Vec::with_capacity(self.width * self.height);
+        let region = Region {
+            x: 0,
+            y: 0,
+            width: self.width,
+            height: self.height,
+        };
+        for row in self.visible_rows(samples, region) {
             validate(row)?;
             output.extend_from_slice(row);
-            output.resize((y + 1) * region.width, row[row.len() - 1]);
-        }
-        let last = (visible_height - 1) * region.width..visible_height * region.width;
-        for _ in visible_height..region.height {
-            output.extend_from_within(last.clone());
         }
         Ok(output)
     }
+}
+
+pub(crate) fn within_patch_bound(samples: &[f32]) -> bool {
+    // Leave ample headroom for box reductions and the sum of squared
+    // differences across 64 pixels. Matching windows then have zero deficit.
+    samples.iter().fold(true, |bounded, &sample| {
+        bounded & ((sample.to_bits() & 0x7fff_ffff) <= 1e12_f32.to_bits())
+    })
+}
+
+pub(crate) fn check_patch_bound(samples: &[f32]) -> Result<bool, Error> {
+    let bounded = within_patch_bound(samples);
+    if !bounded {
+        check_finite(samples)?;
+    }
+    Ok(bounded)
 }
 
 fn check_plane_finite(plane: Plane<'_>) -> Result<(), Error> {
@@ -256,7 +278,7 @@ pub(crate) fn normalize(sample: u8) -> f32 {
 }
 
 #[inline]
-fn check_finite(row: &[f32]) -> Result<(), Error> {
+pub(crate) fn check_finite(row: &[f32]) -> Result<(), Error> {
     // Reduce the row without short-circuiting so the compiler can vectorize it.
     if row.iter().fold(true, |ok, v| ok & v.is_finite()) {
         Ok(())
