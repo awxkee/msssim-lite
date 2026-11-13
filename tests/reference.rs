@@ -108,6 +108,225 @@ fn compare_byte_patches_matches_full_scoring_across_tiles_and_edges() {
 }
 
 #[test]
+fn byte_patch_within_one_window_matches_full_scoring_exactly() {
+    let (w, h) = (511, 255);
+    let source = texture(w, h, 7);
+    let image = GrayImage::u8(&source, w, h, w).unwrap();
+    for scales in 1..=MAX_SCALES {
+        let reference = PreparedReference::with_scales(image, scales).unwrap();
+        for (x, y, pw, ph, change) in [
+            (0, 0, 8, 8, 113),
+            (237, 197, 3, 2, 41),
+            (499, 249, 2, 5, 79),
+            (w - 5, h - 4, 5, 4, 101),
+            (w - 1, h - 1, 1, 1, 0),
+        ] {
+            let stride = pw + 3;
+            let mut patch = vec![0; (ph - 1) * stride + pw];
+            let mut expected = source.clone();
+            for row in 0..ph {
+                for col in 0..pw {
+                    let pixel = &mut expected[(y + row) * w + x + col];
+                    *pixel = pixel.wrapping_add(change);
+                    patch[row * stride + col] = *pixel;
+                }
+            }
+            let patch = GrayImage::u8(&patch, pw, ph, stride).unwrap();
+            assert_eq!(
+                reference.compare_patch(patch, x, y).unwrap(),
+                reference
+                    .compare(GrayImage::u8(&expected, w, h, w).unwrap())
+                    .unwrap(),
+                "scales {scales}, patch at ({x}, {y})"
+            );
+        }
+    }
+}
+
+#[test]
+fn float_patch_within_one_window_matches_full_scoring_exactly() {
+    let (w, h) = (271, 63);
+    let source: Vec<_> = texture(w, h, 7)
+        .into_iter()
+        .map(|v| (f32::from(v) - 128.0) / 256.0)
+        .collect();
+    let image = GrayImage::unit_f32(&source, w, h, w).unwrap();
+    for scales in 1..=MAX_SCALES {
+        let reference = PreparedReference::with_scales(image, scales).unwrap();
+        for (x, y, pw, ph) in [(117, 27, 3, 4), (w - 6, h - 4, 6, 4)] {
+            let stride = pw + 5;
+            let mut patch = vec![f32::NAN; (ph - 1) * stride + pw];
+            let mut candidate = source.clone();
+            for row in 0..ph {
+                for col in 0..pw {
+                    let sample = &mut candidate[(y + row) * w + x + col];
+                    *sample -= (row * pw + col + 1) as f32 / 32.0;
+                    patch[row * stride + col] = *sample;
+                }
+            }
+            let patch = GrayImage::unit_f32(&patch, pw, ph, stride).unwrap();
+            assert_eq!(
+                reference.compare_patch(patch, x, y).unwrap(),
+                reference
+                    .compare(GrayImage::unit_f32(&candidate, w, h, w).unwrap())
+                    .unwrap(),
+                "scales {scales}, patch at ({x}, {y})"
+            );
+        }
+    }
+}
+
+#[test]
+fn small_patches_crossing_windows_match_full_scoring_without_scratch() {
+    let (w, h) = (511, 511);
+    let bytes = texture(w, h, 13);
+    let floats: Vec<_> = bytes.iter().map(|&v| f32::from(v) / 256.0).collect();
+    for (scales, x, y, pw, ph) in [
+        (3, 29, 30, 7, 8),
+        (4, 10, 13, 21, 18),
+        (5, 15, 14, 18, 18),
+        (6, 253, 254, 8, 6),
+        (6, w - 11, h - 12, 11, 12),
+    ] {
+        let byte_reference =
+            PreparedReference::with_scales(GrayImage::u8(&bytes, w, h, w).unwrap(), scales)
+                .unwrap();
+        let float_reference =
+            PreparedReference::with_scales(GrayImage::unit_f32(&floats, w, h, w).unwrap(), scales)
+                .unwrap();
+        let mut byte_candidate = bytes.clone();
+        let mut float_candidate = floats.clone();
+        let stride = pw + 5;
+        let mut byte_patch = vec![0; (ph - 1) * stride + pw];
+        let mut float_patch = vec![f32::NAN; (ph - 1) * stride + pw];
+        for row in 0..ph {
+            for col in 0..pw {
+                let index = (y + row) * w + x + col;
+                byte_candidate[index] = byte_candidate[index].wrapping_add(75);
+                float_candidate[index] += (row + col + 1) as f32 / 32.0;
+                byte_patch[row * stride + col] = byte_candidate[index];
+                float_patch[row * stride + col] = float_candidate[index];
+            }
+        }
+        let mut workspace = msssim_lite::ComparisonWorkspace::default();
+        for (reference, patch, candidate) in [
+            (
+                byte_reference,
+                GrayImage::u8(&byte_patch, pw, ph, stride).unwrap(),
+                GrayImage::u8(&byte_candidate, w, h, w).unwrap(),
+            ),
+            (
+                float_reference,
+                GrayImage::unit_f32(&float_patch, pw, ph, stride).unwrap(),
+                GrayImage::unit_f32(&float_candidate, w, h, w).unwrap(),
+            ),
+        ] {
+            assert_eq!(
+                reference
+                    .compare_patch_with_workspace(patch, x, y, &mut workspace)
+                    .unwrap(),
+                reference.compare(candidate).unwrap(),
+                "scales {scales}, patch at ({x}, {y})",
+            );
+            assert_eq!(workspace.allocated_bytes(), 0);
+        }
+    }
+}
+
+#[test]
+fn thin_patches_reuse_small_workspace_and_match_full_scoring() {
+    let (w, h) = (767, 767);
+    let bytes = texture(w, h, 23);
+    let floats: Vec<_> = bytes.iter().map(|&v| f32::from(v) / 256.0).collect();
+    let byte_reference =
+        PreparedReference::with_scales(GrayImage::u8(&bytes, w, h, w).unwrap(), MAX_SCALES)
+            .unwrap();
+    let float_reference =
+        PreparedReference::with_scales(GrayImage::unit_f32(&floats, w, h, w).unwrap(), MAX_SCALES)
+            .unwrap();
+
+    for (x, y, pw, ph) in [
+        (253, 23, 5, 700),
+        (7, 253, 500, 5),
+        (w - 2, 248, 2, 506),
+        (241, h - 2, 272, 2),
+    ] {
+        let stride = pw + 9;
+        let mut byte_candidate = bytes.clone();
+        let mut float_candidate = floats.clone();
+        let mut byte_patch = vec![0; (ph - 1) * stride + pw];
+        let mut float_patch = vec![f32::NAN; (ph - 1) * stride + pw];
+        for row in 0..ph {
+            for col in 0..pw {
+                let index = (y + row) * w + x + col;
+                byte_candidate[index] = byte_candidate[index].wrapping_add((row + col) as u8);
+                float_candidate[index] += (row + col) as f32 / 512.0;
+                byte_patch[row * stride + col] = byte_candidate[index];
+                float_patch[row * stride + col] = float_candidate[index];
+            }
+        }
+        for (reference, patch, candidate) in [
+            (
+                &byte_reference,
+                GrayImage::u8(&byte_patch, pw, ph, stride).unwrap(),
+                GrayImage::u8(&byte_candidate, w, h, w).unwrap(),
+            ),
+            (
+                &float_reference,
+                GrayImage::unit_f32(&float_patch, pw, ph, stride).unwrap(),
+                GrayImage::unit_f32(&float_candidate, w, h, w).unwrap(),
+            ),
+        ] {
+            let mut workspace = msssim_lite::ComparisonWorkspace::default();
+            let score = reference
+                .compare_patch_with_workspace(patch, x, y, &mut workspace)
+                .unwrap();
+            assert_eq!(
+                score,
+                reference.compare(candidate).unwrap(),
+                "patch at ({x}, {y})"
+            );
+            let retained = workspace.allocated_bytes();
+            assert!(
+                retained > 0 && retained <= 64 * 1024,
+                "patch at ({x}, {y}) used {retained} scratch bytes"
+            );
+            assert_eq!(
+                score,
+                reference
+                    .compare_patch_with_workspace(patch, x, y, &mut workspace)
+                    .unwrap()
+            );
+            assert_eq!(workspace.allocated_bytes(), retained);
+        }
+    }
+}
+
+#[test]
+fn small_float_patch_preserves_overflow_in_untouched_windows() {
+    let mut samples = [0.0; 32 * 32];
+    // These samples overflow during reduction in a different 8×8 window
+    // inside the tile touched by the patch.
+    samples[16..18].fill(f32::MAX);
+    let image = GrayImage::unit_f32(&samples, 32, 32, 32).unwrap();
+    let reference = PreparedReference::new(image).unwrap();
+    let patch = GrayImage::unit_f32(&[0.25], 1, 1, 1).unwrap();
+    let actual = reference.compare_patch(patch, 0, 0).unwrap();
+    samples[0] = 0.25;
+    let expected = reference
+        .compare(GrayImage::unit_f32(&samples, 32, 32, 32).unwrap())
+        .unwrap();
+    assert!(expected.per_scale()[1].is_nan());
+    for (&actual, &expected) in actual.per_scale().iter().zip(expected.per_scale()) {
+        if expected.is_nan() {
+            assert!(actual.is_nan());
+        } else {
+            assert_eq!(actual, expected);
+        }
+    }
+}
+
+#[test]
 fn compare_float_patches_honors_stride_and_validates_the_patch() {
     let (w, h) = (73, 51);
     let source: Vec<_> = texture(w, h, 5)
@@ -205,6 +424,48 @@ fn invalid_inputs_are_rejected() {
             .compare(GrayImage::unit_f32(&nan, 16, 16, 16).unwrap())
             .err(),
         Some(Error::NonFiniteSample)
+    );
+}
+
+#[test]
+fn owned_references_match_borrowed_input_and_validate_samples() {
+    let (w, h) = (19, 23);
+    let bytes = texture(w, h, 3);
+    let floats: Vec<_> = bytes.iter().map(|&v| f32::from(v) / 255.0).collect();
+    let candidate = texture(w, h, 9);
+    let candidate = GrayImage::u8(&candidate, w, h, w).unwrap();
+
+    let borrowed =
+        PreparedReference::with_scales(GrayImage::u8(&bytes, w, h, w).unwrap(), MAX_SCALES)
+            .unwrap();
+    let owned = PreparedReference::from_u8(bytes, w, h, MAX_SCALES).unwrap();
+    assert_eq!(owned.compare(candidate), borrowed.compare(candidate));
+
+    let borrowed =
+        PreparedReference::with_scales(GrayImage::unit_f32(&floats, w, h, w).unwrap(), MAX_SCALES)
+            .unwrap();
+    let owned = PreparedReference::from_unit_f32(floats, w, h, MAX_SCALES).unwrap();
+    assert_eq!(owned.compare(candidate), borrowed.compare(candidate));
+
+    assert_eq!(
+        PreparedReference::from_u8(vec![0; 3], 2, 2, 1).err(),
+        Some(Error::InvalidLayout)
+    );
+    assert_eq!(
+        PreparedReference::from_unit_f32(vec![0.0; 5], 2, 2, 1).err(),
+        Some(Error::InvalidLayout)
+    );
+    assert_eq!(
+        PreparedReference::from_unit_f32(vec![f32::INFINITY], 1, 1, 1).err(),
+        Some(Error::NonFiniteSample)
+    );
+    assert_eq!(
+        PreparedReference::from_u8(vec![0], 1, 1, 0).err(),
+        Some(Error::InvalidScales)
+    );
+    assert_eq!(
+        PreparedReference::from_u8(vec![], usize::MAX, 2, 1).err(),
+        Some(Error::InvalidDimensions)
     );
 }
 

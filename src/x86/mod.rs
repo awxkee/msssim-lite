@@ -29,4 +29,7 @@
 
 mod downsample;
 
-pub(crate) use downsample::halve_bytes;
+#[cfg(feature = "sse")]
+pub(crate) use downsample::{halve_bytes, halve_float_in_place};
+#[cfg(all(feature = "avx", target_arch = "x86_64"))]
+pub(crate) use downsample::{halve_bytes_avx2, halve_float_in_place_avx2};

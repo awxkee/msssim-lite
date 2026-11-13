@@ -29,6 +29,7 @@
 
 use crate::image::normalize;
 use crate::kernel::window;
+use crate::pyramid::normalize_sum;
 use std::arch::aarch64::*;
 
 trait Samples {
@@ -51,11 +52,26 @@ impl Samples for u8 {
     unsafe fn load_row(ptr: *const Self) -> [float32x4_t; 2] {
         // SAFETY: The caller provides eight readable samples.
         let wide = vmovl_u8(unsafe { vld1_u8(ptr) });
-        let lower = vcvtq_f32_u32(vmovl_u16(vget_low_u16(wide)));
-        let upper = vcvtq_f32_u32(vmovl_high_u16(wide));
-        let scale = normalize(1);
-        [vmulq_n_f32(lower, scale), vmulq_n_f32(upper, scale)]
+        normalize_words(wide, normalize(1))
     }
+}
+
+impl Samples for u16 {
+    #[inline]
+    #[target_feature(enable = "neon")]
+    unsafe fn load_row(ptr: *const Self) -> [float32x4_t; 2] {
+        // SAFETY: The caller provides eight readable samples.
+        let wide = unsafe { vld1q_u16(ptr) };
+        normalize_words(wide, normalize_sum(1))
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn normalize_words(wide: uint16x8_t, scale: f32) -> [float32x4_t; 2] {
+    let lower = vcvtq_f32_u32(vmovl_u16(vget_low_u16(wide)));
+    let upper = vcvtq_f32_u32(vmovl_high_u16(wide));
+    [vmulq_n_f32(lower, scale), vmulq_n_f32(upper, scale)]
 }
 
 #[derive(Clone, Copy)]
@@ -136,6 +152,32 @@ pub(crate) unsafe fn deficit(
 #[target_feature(enable = "neon")]
 pub(crate) unsafe fn mixed_deficit(
     reference: &[u8],
+    reference_stride: usize,
+    test: &[f32],
+    test_stride: usize,
+    width: usize,
+    height: usize,
+) -> f64 {
+    // SAFETY: The caller supplies the required strided rectangles and NEON.
+    unsafe {
+        score(
+            reference,
+            reference_stride,
+            test,
+            test_stride,
+            width,
+            height,
+        )
+    }
+}
+
+/// # Safety
+/// The CPU must support NEON. Width and height must be nonzero multiples of
+/// eight. Each stride must be at least width and each slice must cover its
+/// active rectangle through the last pixel of the last row.
+#[target_feature(enable = "neon")]
+pub(crate) unsafe fn byte_sum_deficit(
+    reference: &[u16],
     reference_stride: usize,
     test: &[f32],
     test_stride: usize,

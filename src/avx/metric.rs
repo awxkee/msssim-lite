@@ -29,10 +29,8 @@
 
 use crate::image::normalize;
 use crate::kernel::window;
+use crate::pyramid::normalize_sum;
 
-#[cfg(target_arch = "x86")]
-use std::arch::x86::*;
-#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
 #[inline]
@@ -61,7 +59,7 @@ pub(crate) unsafe fn deficit(
 ) -> f64 {
     // SAFETY: This specialization reads four bytes per reference sample.
     unsafe {
-        score::<false>(
+        score::<4>(
             reference.as_ptr().cast(),
             reference_stride,
             test.as_ptr(),
@@ -87,7 +85,7 @@ pub(crate) unsafe fn mixed_deficit(
 ) -> f64 {
     // SAFETY: This specialization reads one byte per reference sample.
     unsafe {
-        score::<true>(
+        score::<1>(
             reference.as_ptr(),
             reference_stride,
             test.as_ptr(),
@@ -98,8 +96,34 @@ pub(crate) unsafe fn mixed_deficit(
     }
 }
 
+/// # Safety
+/// AVX2 and FMA must be available. Width and height must be positive
+/// multiples of eight. Each stride must be at least the width, and each
+/// slice must cover the active rectangle for its stride.
 #[target_feature(enable = "avx2,fma")]
-unsafe fn score<const BYTE: bool>(
+pub(crate) unsafe fn byte_sum_deficit(
+    reference: &[u16],
+    reference_stride: usize,
+    test: &[f32],
+    test_stride: usize,
+    width: usize,
+    height: usize,
+) -> f64 {
+    // SAFETY: This specialization reads two bytes per reference sample.
+    unsafe {
+        score::<2>(
+            reference.as_ptr().cast(),
+            reference_stride,
+            test.as_ptr(),
+            test_stride,
+            width,
+            height,
+        )
+    }
+}
+
+#[target_feature(enable = "avx2,fma")]
+unsafe fn score<const SAMPLE_BYTES: usize>(
     reference: *const u8,
     reference_stride: usize,
     test: *const f32,
@@ -107,8 +131,7 @@ unsafe fn score<const BYTE: bool>(
     width: usize,
     height: usize,
 ) -> f64 {
-    let sample_size = if BYTE { 1 } else { size_of::<f32>() };
-    let reference_stride = reference_stride * sample_size;
+    let reference_stride = reference_stride * SAMPLE_BYTES;
     let mut total = 0.0;
     // Each window contains eight full rows of eight samples in both images.
     unsafe {
@@ -116,12 +139,12 @@ unsafe fn score<const BYTE: bool>(
             let reference_row = reference.add(y * reference_stride);
             let test_row = test.add(y * test_stride);
             for x in (0..width).step_by(8) {
-                let reference_block = reference_row.add(x * sample_size);
+                let reference_block = reference_row.add(x * SAMPLE_BYTES);
                 let test_block = test_row.add(x);
-                let base_a = if BYTE {
-                    normalize(*reference_block)
-                } else {
-                    *reference_block.cast::<f32>()
+                let base_a = match SAMPLE_BYTES {
+                    1 => normalize(*reference_block),
+                    2 => normalize_sum(*reference_block.cast::<u16>()),
+                    _ => *reference_block.cast::<f32>(),
                 };
                 let base_b = *test_block;
                 let base_av = _mm256_set1_ps(base_a);
@@ -133,12 +156,21 @@ unsafe fn score<const BYTE: bool>(
                 let (mut square_a, mut square_b, mut square_d) = (zero, zero, zero);
                 for row in 0..8 {
                     let a = reference_block.add(row * reference_stride);
-                    let a = if BYTE {
-                        let bytes = _mm_loadu_si64(a);
-                        let words = _mm256_cvtepu8_epi32(bytes);
-                        _mm256_mul_ps(_mm256_cvtepi32_ps(words), _mm256_set1_ps(normalize(1)))
-                    } else {
-                        _mm256_loadu_ps(a.cast())
+                    let a = match SAMPLE_BYTES {
+                        1 => {
+                            let bytes = _mm_loadu_si64(a);
+                            let words = _mm256_cvtepu8_epi32(bytes);
+                            _mm256_mul_ps(_mm256_cvtepi32_ps(words), _mm256_set1_ps(normalize(1)))
+                        }
+                        2 => {
+                            let words = _mm_loadu_si128(a.cast());
+                            let wide = _mm256_cvtepu16_epi32(words);
+                            _mm256_mul_ps(
+                                _mm256_cvtepi32_ps(wide),
+                                _mm256_set1_ps(normalize_sum(1)),
+                            )
+                        }
+                        _ => _mm256_loadu_ps(a.cast()),
                     };
                     let b = _mm256_loadu_ps(test_block.add(row * test_stride));
                     let d = _mm256_sub_ps(_mm256_sub_ps(a, b), base_dv);

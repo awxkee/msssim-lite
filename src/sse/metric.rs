@@ -29,6 +29,7 @@
 
 use crate::image::normalize;
 use crate::kernel::window;
+use crate::pyramid::normalize_sum;
 
 #[cfg(target_arch = "x86")]
 use std::arch::x86::*;
@@ -57,7 +58,7 @@ pub(crate) unsafe fn deficit(
 ) -> f64 {
     // SAFETY: This specialization reads four bytes per reference sample.
     unsafe {
-        score::<false>(
+        score::<4>(
             reference.as_ptr().cast(),
             reference_stride,
             test.as_ptr(),
@@ -83,7 +84,7 @@ pub(crate) unsafe fn mixed_deficit(
 ) -> f64 {
     // SAFETY: This specialization reads one byte per reference sample.
     unsafe {
-        score::<true>(
+        score::<1>(
             reference.as_ptr(),
             reference_stride,
             test.as_ptr(),
@@ -94,8 +95,34 @@ pub(crate) unsafe fn mixed_deficit(
     }
 }
 
+/// # Safety
+/// SSE2 must be available. Width and height must be positive multiples
+/// of eight. Each stride must be at least the width, and each slice must
+/// cover the active rectangle for its stride.
 #[target_feature(enable = "sse2")]
-unsafe fn score<const BYTE: bool>(
+pub(crate) unsafe fn byte_sum_deficit(
+    reference: &[u16],
+    reference_stride: usize,
+    test: &[f32],
+    test_stride: usize,
+    width: usize,
+    height: usize,
+) -> f64 {
+    // SAFETY: This specialization reads two bytes per reference sample.
+    unsafe {
+        score::<2>(
+            reference.as_ptr().cast(),
+            reference_stride,
+            test.as_ptr(),
+            test_stride,
+            width,
+            height,
+        )
+    }
+}
+
+#[target_feature(enable = "sse2")]
+unsafe fn score<const SAMPLE_BYTES: usize>(
     reference: *const u8,
     reference_stride: usize,
     test: *const f32,
@@ -103,8 +130,7 @@ unsafe fn score<const BYTE: bool>(
     width: usize,
     height: usize,
 ) -> f64 {
-    let sample_size = if BYTE { 1 } else { size_of::<f32>() };
-    let reference_stride = reference_stride * sample_size;
+    let reference_stride = reference_stride * SAMPLE_BYTES;
     let mut total = 0.0;
     // Each window contains eight full rows of eight samples in both images.
     unsafe {
@@ -112,12 +138,12 @@ unsafe fn score<const BYTE: bool>(
             let reference_row = reference.add(y * reference_stride);
             let test_row = test.add(y * test_stride);
             for x in (0..width).step_by(8) {
-                let reference_block = reference_row.add(x * sample_size);
+                let reference_block = reference_row.add(x * SAMPLE_BYTES);
                 let test_block = test_row.add(x);
-                let base_a = if BYTE {
-                    normalize(*reference_block)
-                } else {
-                    *reference_block.cast::<f32>()
+                let base_a = match SAMPLE_BYTES {
+                    1 => normalize(*reference_block),
+                    2 => normalize_sum(*reference_block.cast::<u16>()),
+                    _ => *reference_block.cast::<f32>(),
                 };
                 let base_b = *test_block;
                 let base_av = _mm_set1_ps(base_a);
@@ -130,17 +156,24 @@ unsafe fn score<const BYTE: bool>(
                 for row in 0..8 {
                     let reference_pixels = reference_block.add(row * reference_stride);
                     let test_pixels = test_block.add(row * test_stride);
-                    let halves = if BYTE {
+                    let halves = if SAMPLE_BYTES == 4 {
+                        let a = reference_pixels.cast::<f32>();
+                        [_mm_loadu_ps(a), _mm_loadu_ps(a.add(4))]
+                    } else {
                         let zero = _mm_setzero_si128();
-                        let words = _mm_unpacklo_epi8(_mm_loadu_si64(reference_pixels), zero);
-                        let scale = _mm_set1_ps(normalize(1));
+                        let (words, scale) = if SAMPLE_BYTES == 1 {
+                            (
+                                _mm_unpacklo_epi8(_mm_loadu_si64(reference_pixels), zero),
+                                normalize(1),
+                            )
+                        } else {
+                            (_mm_loadu_si128(reference_pixels.cast()), normalize_sum(1))
+                        };
+                        let scale = _mm_set1_ps(scale);
                         [
                             _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpacklo_epi16(words, zero)), scale),
                             _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpackhi_epi16(words, zero)), scale),
                         ]
-                    } else {
-                        let a = reference_pixels.cast::<f32>();
-                        [_mm_loadu_ps(a), _mm_loadu_ps(a.add(4))]
                     };
                     let test_halves = [_mm_loadu_ps(test_pixels), _mm_loadu_ps(test_pixels.add(4))];
                     for (a, b) in halves.into_iter().zip(test_halves) {

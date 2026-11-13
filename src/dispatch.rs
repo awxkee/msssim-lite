@@ -32,27 +32,34 @@
 #[cfg(not(all(feature = "neon", target_arch = "aarch64")))]
 use crate::kernel;
 use crate::kernel::DeficitFn;
-use crate::pyramid::{self, Plane, TilePlane, WINDOW};
+use crate::pyramid::{Plane, TilePlane, WINDOW};
+#[cfg(not(all(feature = "neon", target_arch = "aarch64")))]
+use crate::pyramid::{halve_bytes, halve_in_place};
 
 type HalveBytesFn = unsafe fn(Plane<'_, u8>, &mut [f32]);
+type HalveFloatInPlaceFn = unsafe fn(&mut [f32], usize, usize);
 
 #[derive(Clone, Copy)]
 pub(crate) struct Kernels {
     deficit: DeficitFn,
     byte_deficit: DeficitFn<u8>,
     mixed_deficit: DeficitFn<u8, f32>,
+    byte_sum_deficit: DeficitFn<u16, f32>,
     halve_bytes: HalveBytesFn,
+    halve_float_in_place: HalveFloatInPlaceFn,
 }
 
 impl Kernels {
     pub(crate) fn new() -> Self {
-        #[cfg(all(feature = "avx", any(target_arch = "x86", target_arch = "x86_64")))]
+        #[cfg(all(feature = "avx", target_arch = "x86_64"))]
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
             return Self {
                 deficit: crate::avx::deficit,
                 byte_deficit: crate::avx::byte_deficit,
                 mixed_deficit: crate::avx::mixed_deficit,
-                halve_bytes: crate::x86::halve_bytes,
+                byte_sum_deficit: crate::avx::byte_sum_deficit,
+                halve_bytes: crate::x86::halve_bytes_avx2,
+                halve_float_in_place: crate::x86::halve_float_in_place_avx2,
             };
         }
         #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -61,16 +68,27 @@ impl Kernels {
                 deficit: crate::sse::deficit,
                 byte_deficit: crate::sse::byte_deficit,
                 mixed_deficit: crate::sse::mixed_deficit,
+                byte_sum_deficit: crate::sse::byte_sum_deficit,
                 halve_bytes: crate::x86::halve_bytes,
+                halve_float_in_place: crate::x86::halve_float_in_place,
             };
         }
         #[cfg(all(feature = "neon", target_arch = "aarch64"))]
         {
+            let byte_deficit = crate::neon::byte_deficit;
+            #[cfg(target_endian = "little")]
+            let byte_deficit = if std::arch::is_aarch64_feature_detected!("dotprod") {
+                crate::neon::byte_deficit_dot
+            } else {
+                byte_deficit
+            };
             Self {
                 deficit: crate::neon::deficit,
-                byte_deficit: crate::neon::byte_deficit,
+                byte_deficit,
                 mixed_deficit: crate::neon::mixed_deficit,
-                halve_bytes: pyramid::halve_bytes,
+                byte_sum_deficit: crate::neon::byte_sum_deficit,
+                halve_bytes: crate::neon::halve_bytes,
+                halve_float_in_place: crate::neon::halve_float_in_place,
             }
         }
         #[cfg(not(all(feature = "neon", target_arch = "aarch64")))]
@@ -79,7 +97,9 @@ impl Kernels {
                 deficit: kernel::scalar,
                 byte_deficit: kernel::byte_scalar,
                 mixed_deficit: kernel::mixed_scalar,
-                halve_bytes: pyramid::halve_bytes,
+                byte_sum_deficit: kernel::byte_sum_scalar,
+                halve_bytes,
+                halve_float_in_place: halve_in_place,
             }
         }
     }
@@ -93,6 +113,10 @@ impl Kernels {
         }
     }
 
+    pub(crate) fn byte_sum_deficit(self, reference: Plane<'_, u16>, test: Plane<'_>) -> f64 {
+        score(self.byte_sum_deficit, reference, test)
+    }
+
     pub(crate) fn halve_bytes(self, input: Plane<'_, u8>, output: &mut [f32]) {
         assert!(input.width > 0 && input.width.is_multiple_of(2 * WINDOW));
         assert!(input.height > 0 && input.height.is_multiple_of(2));
@@ -100,6 +124,18 @@ impl Kernels {
         assert_eq!(output.len(), (input.width / 2) * (input.height / 2));
         // SAFETY: Dispatch checked CPU features and the slices cover the reduction.
         unsafe { (self.halve_bytes)(input, output) }
+    }
+
+    pub(crate) fn halve_float_in_place(self, samples: &mut [f32], width: usize, height: usize) {
+        assert!(width > 0 && width.is_multiple_of(2 * WINDOW));
+        assert!(height > 0 && height.is_multiple_of(2));
+        assert!(
+            width
+                .checked_mul(height)
+                .is_some_and(|n| n <= samples.len())
+        );
+        // SAFETY: Dispatch checked CPU features and the slice holds the packed level.
+        unsafe { (self.halve_float_in_place)(samples, width, height) }
     }
 }
 
@@ -132,4 +168,50 @@ fn check_plane(stride: usize, width: usize, height: usize, len: usize) {
             .and_then(|n| n.checked_add(width))
             .is_some_and(|needed| needed <= len)
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pyramid::normalize_sum;
+
+    #[test]
+    fn byte_sum_scoring_matches_expanded_float_scoring() {
+        let (width, height) = (32, 32);
+        let reference_stride = width + 5;
+        let test_stride = width + 3;
+        let sums: Vec<_> = (0..(height - 1) * reference_stride + width)
+            .map(|i| (i % 1021) as u16)
+            .collect();
+        let expanded: Vec<_> = sums.iter().copied().map(normalize_sum).collect();
+        let candidate: Vec<_> = (0..(height - 1) * test_stride + width)
+            .map(|i| ((i * 17) % 199) as f32 / 198.0)
+            .collect();
+        let kernels = Kernels::new();
+        let sums = Plane {
+            samples: &sums,
+            stride: reference_stride,
+            width,
+            height,
+        };
+        let expanded = Plane {
+            samples: &expanded,
+            stride: reference_stride,
+            width,
+            height,
+        };
+        let candidate = Plane {
+            samples: &candidate,
+            stride: test_stride,
+            width,
+            height,
+        };
+
+        assert_eq!(
+            kernels.byte_sum_deficit(sums, candidate).to_bits(),
+            kernels
+                .deficit(TilePlane::Float(expanded), TilePlane::Float(candidate))
+                .to_bits()
+        );
+    }
 }

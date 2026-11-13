@@ -31,4 +31,4 @@ mod bytes;
 mod metric;
 
 pub(crate) use bytes::byte_deficit;
-pub(crate) use metric::{deficit, mixed_deficit};
+pub(crate) use metric::{byte_sum_deficit, deficit, mixed_deficit};
